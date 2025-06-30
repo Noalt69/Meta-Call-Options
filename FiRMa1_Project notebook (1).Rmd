@@ -1,0 +1,1164 @@
+---
+title: "FRMI Project"
+output: html_document
+date: "2024-12-16"
+---
+
+
+
+```{r}
+library(RQuantLib)
+
+```
+
+
+## Single Option 
+
+### Delta
+
+```{r}
+# Import data
+
+date = c("2024-10-11",
+         "2024-09-13",
+         "2024-11-15",
+         "2024-08-16",
+         "2024-10-18",
+         "2024-09-20",
+         "2024-11-22",
+         "2024-08-23",
+         "2024-10-25",
+         "2024-09-27",
+         "2024-11-29")
+
+files <- c("call_meta_111024.csv",
+         'call_meta_130924.csv',
+         'call_meta_151124.csv',
+         'call_meta_160824.csv',
+         'call_meta_181024.csv',
+         'call_meta_200924.csv',
+         'call_meta_221124.csv',
+         'call_meta_230824.csv',
+         'call_meta_251024.csv',
+         'call_meta_270924.csv',
+         'call_meta_291124.csv')
+
+data_dict <- list()
+
+# Risk-free rate
+r <- 5.219121339/100
+
+# Implied Volatility Calculation Function
+calculate_implied_volatility <- function(S, E, C, T, r) {
+  iv <- EuropeanOptionImpliedVolatility(type = 'call',
+                                        value = C, 
+                                        underlying = S, 
+                                        strike = E, 
+                                        dividendYield = 0, 
+                                        riskFreeRate = r,
+                                        maturity = T,
+                                        volatility = 0.2)
+  return(iv)  
+}
+
+# Option Greeks Calculation Functions
+calculate_greeks <- function(S, E, T, r, sigma, type = "call") {
+  # Compute all Greeks using a single call to EuropeanOption
+  option <- EuropeanOption(type = type, underlying = S, strike = E,
+                           riskFreeRate = r, maturity = T, volatility = sigma,
+                           dividendYield = 0)
+  
+  # Return a list of Greeks
+  return(list(Delta = option$delta,
+              Vega  = option$vega,
+              Gamma = option$gamma))
+}
+
+# Main processing loop
+for (i in seq_along(files)) {
+  
+  df <- read.csv(files[i])
+  
+  df$Strike_585 <- 585
+  
+  # Process dates and calculate time to maturity
+  df$X <- as.Date(df$X, format = "%Y-%m-%d")
+  maturity_date <- as.Date(date[i])
+  df$Time_to_Maturity <- as.numeric(difftime(maturity_date, df$X, units = "days")) / 252
+  df <- df[df$Time_to_Maturity > 0 & df$Time_to_Maturity <= 45 / 252, ]
+  
+  # Implied Volatility Calculation
+  df$iv_values_585 <- mapply(
+    calculate_implied_volatility, 
+    S = df$Underlying, 
+    E = df$Strike_585, 
+    C = df$C585, 
+    T = df$Time_to_Maturity, 
+    r = r
+  )
+  
+  # Greeks Calculation
+  greeks <- mapply(
+    function(S, E, T, sigma) {
+      calculate_greeks(S, E, T, r, sigma, type = "call")
+    }, 
+    S = df$Underlying, 
+    E = df$Strike_585, 
+    T = df$Time_to_Maturity, 
+    sigma = df$iv_values_585, 
+    SIMPLIFY = FALSE
+  )
+  
+  # Unpack Greeks into columns
+  df$Delta <- sapply(greeks, `[[`, "Delta")
+  df$Vega  <- sapply(greeks, `[[`, "Vega")
+  df$Gamma <- sapply(greeks, `[[`, "Gamma")
+  
+  
+  data_dict[[date[i]]] <- df
+}
+
+
+```
+
+```{r}
+data_dict
+```
+
+
+#### Daily
+
+```{r}
+hedging_results_delta <- data.frame(
+  OP_Date = character(),
+  Frequency = integer(),
+  MSE = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Hedge daily
+for (i in seq_along(date)) {
+  df = data_dict[[date[i]]]
+  df$OP <- 0
+  df$RE <- 0
+  df$Change_OP_daily <- 0
+  df$Change_RE_daily <- 0
+  df$A_585_daily <- 0
+  
+  
+  
+  df$OP[1] <- df$C585[1]
+  df$RE[1] <- df$Delta[1]*df$Underlying[1]
+  
+  for (j in 2:nrow(df)) {
+    df$OP[j] <- df$C585[j] 
+    df$RE[j] <- df$Delta[j-1] * df$Underlying[j]
+    df$Change_OP_daily[j] <- df$OP[j] - df$OP[j-1]
+    df$Change_RE_daily[j] <- df$RE[j] - df$RE[j-1]
+    df$A_585_daily[j] <- (df$Change_OP_daily[j] -  df$Change_RE_daily[j])^2
+    
+    # Re-hedge
+    df$RE[j] <- df$Delta[j]*df$Underlying[j]    
+  }
+  mse_daily <- mean(df$A_585_daily, na.rm = TRUE)
+  
+  hedging_results_delta <- rbind(hedging_results_delta, data.frame(
+  OP_Date = date[i],
+  Frequency = 1,
+  MSE = mse_daily,
+  stringsAsFactors = FALSE))
+} 
+
+hedging_results_delta
+
+```
+
+#### Other frequency
+
+```{r}
+# Function to hedge at frequencies 2:7 days
+hedge_frequency <- function(df, frequency) {
+  
+  # Dynamically create new columns based on frequency
+  delta_OP <- paste("Change_OP", frequency, "days", sep = "_")
+  delta_RE <- paste("Change_RE", frequency, "days", sep = "_")
+  A <- paste("A_585", frequency, "days", sep = "_")
+  
+  # Initialize columns for the given frequency
+  df$OP <- 0
+  df$RE <- 0
+  
+  df$OP[1] <- df$C585[1]
+  df$RE[1] <- df$Delta[1]*df$Underlying[1]
+  
+  df[[delta_OP]] <- 0
+  df[[delta_RE]] <- 0
+  df[[A]] <- 0
+  a <- 0
+
+  # Loop through the data frame to hedge at the given frequency
+  for (j in 2:nrow(df)) {
+    a <- a+1
+    # Calculate the change in option value (Delta_C)
+    df$OP[j] <- df$C585[j] 
+    df$RE[j] <- df$Delta[j-a] * df$Underlying[j]
+    
+    df[[delta_OP]][j] <- df$OP[j] - df$OP[j-1]
+    df[[delta_RE]][j] <- df$RE[j] - df$RE[j-1]
+    df[[A]][j] <- (df[[delta_OP]][j] -  df[[delta_RE]][j])^2
+    
+    # Hedge every "frequency" days
+    if (j %% frequency == 1) {
+      a <- 0
+      #print(paste(i, "-", a, sep = ""))
+      df$RE[j] <- df$Delta[j]*df$Underlying[j]
+    } 
+      
+  }
+    
+  return(mean(df[[A]], na.rm = TRUE))
+}
+
+for (i in seq_along(date)) {
+  df = data_dict[[date[i]]]
+  
+  # Hedge with different frequencies: daily, every 2nd day, every 3rd day, ..., every 7th day
+  frequencies <- 2:7  
+  
+  for (freq in frequencies) {
+    mse <- hedge_frequency(df, freq)
+    hedging_results_delta <- rbind(hedging_results_delta, data.frame(
+      OP_Date = date[i],
+      Frequency = freq,
+      MSE = mse,
+      stringsAsFactors = FALSE))
+  }
+  
+}
+hedging_results_delta
+```
+
+```{r}
+# Summarize results
+summary_results_delta <- hedging_results_delta %>%
+  group_by(Frequency) %>%
+  summarise(
+    Mean_MSE = mean(MSE),
+    STD_MSE = sd(MSE),
+    Min_MSE = min(MSE),
+    Max_MSE = max(MSE)
+  )
+
+# Print results
+print(hedging_results_delta)
+print(summary_results_delta)
+```
+
+#### Effect of transaction cost (Delta-hedge)
+```{r}
+# Daily hedge
+hedge_daily <- function(df) {
+  df$OP <- 0
+  df$RE <- 0
+  df$Change_OP_daily <- 0
+  df$Change_RE_daily <- 0
+  df$A_585_daily <- 0
+
+
+  # First trading date
+  df$OP[1] <- df$C585[1] 
+  df$RE[1] <- df$Delta[1]*df$Underlying[1]
+  df$Transaction_Cost[1] <- df$RE[1] * 0.05
+  
+  for (j in 2:nrow(df)) {
+    df$OP[j] <- df$C585[j] 
+    df$RE[j] <- df$Delta[j-1] * df$Underlying[j]
+    df$Change_OP_daily[j] <- df$OP[j] - df$OP[j-1]
+    df$Change_RE_daily[j] <- df$RE[j] - df$RE[j-1]
+    
+    
+    # Re-hedge
+    df$Transaction_Cost[j] <- 0.05 * abs((df$Delta[j] - df$Delta[j-1]) * df$Underlying[j])
+    df$RE[j] <- df$Delta[j] * df$Underlying[j]
+    df$A_585_daily[j] <- (df$Change_OP_daily[j] - df$Change_RE_daily[j] + df$Transaction_Cost[j])^2
+  }
+  return(mean(df$A_585_daily, na.rm = TRUE))
+}
+
+
+# Re_hedging every x days
+hedge_frequency <- function(df,frequency) {
+  # Dynamically create new columns based on frequency
+  delta_OP <- paste("Change_OP", frequency, "days", sep = "_")
+  delta_RE <- paste("Change_RE", frequency, "days", sep = "_")
+  A <- paste("A_585", frequency, "days", sep = "_")
+  
+  # Initialize 
+  df$OP <- 0
+  df$RE <- 0
+  
+  df$OP[1] <- df$C585[1] 
+  df$RE[1] <- df$Delta[1]*df$Underlying[1]
+  df$Transaction_Cost[1] <- df$RE[1] * 0.05
+  
+  df[[delta_OP]] <- 0
+  df[[delta_RE]] <- 0
+  df[[A]] <- 0
+  a <- 0
+  
+  # Loop through the data frame to hedge at the given frequency
+  for (j in 2:nrow(df)) {
+    
+    a <- a + 1
+    
+    # Calculate the change in option value (Delta_C)
+    df$OP[j] <- df$C585[j] 
+    df$RE[j] <- df$Delta[j-a]*df$Underlying[j]
+    
+    df[[delta_OP]][j] <- df$OP[j] - df$OP[j-1]
+    df[[delta_RE]][j] <- df$RE[j] - df$RE[j-1]
+    
+    # Re-hedge every "frequency" days
+    if (j %% frequency == 1) {
+      df$RE[j] <- df$Delta[j]*df$Underlying[j]
+      df$Transaction_Cost[j] <- 0.05 * abs((df$Delta[j] - df$Delta[j-a]) * df$Underlying[j])
+      a <- 0
+    }
+    else {
+      df$Transaction_Cost[j] <- 0
+    }
+    df[[A]][j] <- (df[[delta_OP]][j] -  df[[delta_RE]][j] + df$Transaction_Cost[j])^2
+  }
+  
+  return(mean(df[[A]], na.rm = TRUE))
+}
+
+# Initialize results storage
+delta_hedging_results_transaction_cost <- data.frame(
+  OP_Date = character(),
+  Frequency = integer(),
+  MSE = numeric(),
+  stringsAsFactors = FALSE
+)
+
+
+for (i in seq_along(date)) {
+  df = data_dict[[date[i]]]
+  
+  # Hedge daily
+  mse_daily <- hedge_daily(df)
+  
+  delta_hedging_results_transaction_cost <- rbind(delta_hedging_results_transaction_cost, data.frame(
+    OP_Date = date[i],
+    Frequency = 1,
+    MSE = mse_daily,
+    stringsAsFactors = FALSE))
+    
+    
+  # Hedging every x days
+  for (freq in 2:7) {
+    mse <- hedge_frequency(df, freq)
+      
+  
+    delta_hedging_results_transaction_cost <- rbind(delta_hedging_results_transaction_cost, data.frame(
+      OP_Date = date[i],
+      Frequency = freq,
+      MSE = mse,
+      stringsAsFactors = FALSE
+    ))
+  }
+}
+
+
+
+# Summarize results
+summary_delta_transaction_cost <- delta_hedging_results_transaction_cost %>%
+  group_by(Frequency) %>%
+  summarise(
+    Mean_MSE = mean(MSE),
+    STD_MSE = sd(MSE),
+    Min_MSE = min(MSE),
+    Max_MSE = max(MSE)
+  )
+
+# Print results
+print(delta_hedging_results_transaction_cost)
+print(summary_delta_transaction_cost)
+```
+
+```{r}
+TC_compare <- merge(
+        summary_results_delta[,1:3], 
+        summary_delta_transaction_cost[,1:3], 
+        by = "Frequency", 
+        all.x = TRUE, 
+        suffixes = c("_No_TC", "_TC")
+      )
+TC_compare
+```
+
+```{r}
+library(ggplot2)
+data_long <- reshape2::melt(TC_compare, id.vars = "Frequency", 
+                            variable.name = "Type", 
+                            value.name = "MSE")
+
+# Plot the lines
+ggplot(data_long, aes(x = Frequency, y = MSE, color = Type, group = Type)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  labs(
+    title = "Comparison of Mean MSE with and without Transaction Costs",
+    x = "Frequency",
+    y = "Mean MSE",
+    color = "Type"
+  ) +
+  theme_minimal()
+```
+```{r}
+ggsave("TC compare.png", width = 8, height = 5, units = "in", bg = "white")
+```
+
+
+
+### Delta - Vega
+
+```{r}
+# Import data
+
+date = c("2024-10-11",
+         "2024-09-13",
+         "2024-11-15",
+         "2024-08-16",
+         "2024-10-18",
+         "2024-09-20",
+         "2024-11-22",
+         "2024-08-23",
+         "2024-10-25",
+         "2024-09-27",
+         "2024-11-29")
+
+files <- c("call_meta_111024.csv",
+         'call_meta_130924.csv',
+         'call_meta_151124.csv',
+         'call_meta_160824.csv',
+         'call_meta_181024.csv',
+         'call_meta_200924.csv',
+         'call_meta_221124.csv',
+         'call_meta_230824.csv',
+         'call_meta_251024.csv',
+         'call_meta_270924.csv',
+         'call_meta_291124.csv')
+
+data_dict <- list()
+
+# Risk-free rate
+r <- 5.219121339/100
+
+# Implied Volatility Calculation Function
+calculate_implied_volatility <- function(S, E, C, T, r) {
+  iv <- EuropeanOptionImpliedVolatility(type = 'call',
+                                        value = C, 
+                                        underlying = S, 
+                                        strike = E, 
+                                        dividendYield = 0, 
+                                        riskFreeRate = r,
+                                        maturity = T,
+                                        volatility = 0.2)
+  return(iv)  
+}
+
+# Option Greeks Calculation Functions
+calculate_greeks <- function(S, E, T, r, sigma, type = "call") {
+  # Compute all Greeks using a single call to EuropeanOption
+  option <- EuropeanOption(type = type, underlying = S, strike = E,
+                           riskFreeRate = r, maturity = T, volatility = sigma,
+                           dividendYield = 0)
+  
+  # Return a list of Greeks
+  return(list(Delta = option$delta,
+              Vega  = option$vega,
+              Gamma = option$gamma))
+}
+
+# Main processing loop
+for (i in seq_along(files)) {
+  
+  df <- read.csv(files[i])
+  
+  df$Strike_585 <- 585
+  
+  # Process dates and calculate time to maturity
+  df$X <- as.Date(df$X, format = "%Y-%m-%d")
+  df$maturity_date <- as.Date(date[i])
+  df$Time_to_Maturity <- as.numeric(difftime(df$maturity_date, df$X, units = "days")) / 252
+  
+  # Implied Volatility Calculation
+  df$iv_values_585 <- mapply(
+    calculate_implied_volatility, 
+    S = df$Underlying, 
+    E = df$Strike_585, 
+    C = df$C585, 
+    T = df$Time_to_Maturity, 
+    r = r
+  )
+  
+  # Greeks Calculation
+  greeks <- mapply(
+    function(S, E, T, sigma) {
+      calculate_greeks(S, E, T, r, sigma, type = "call")
+    }, 
+    S = df$Underlying, 
+    E = df$Strike_585, 
+    T = df$Time_to_Maturity, 
+    sigma = df$iv_values_585, 
+    SIMPLIFY = FALSE
+  )
+  
+  # Unpack Greeks into columns
+  df$Delta <- sapply(greeks, `[[`, "Delta")
+  df$Vega  <- sapply(greeks, `[[`, "Vega")
+  df$Gamma <- sapply(greeks, `[[`, "Gamma")
+  
+  
+  data_dict[[date[i]]] <- df
+}
+```
+
+```{r}
+data_dict[["2024-10-18"]]
+```
+
+
+```{r}
+# Daily hedge
+hedge_daily <- function(df) {
+  df$OP <- 0
+  df$RE <- 0
+  df$Change_OP_daily <- 0
+  df$Change_RE_daily <- 0
+  df$A_585_daily <- 0
+
+
+  # First trading date
+  df$OP[1] <- df$C585_BS[1]
+  df$RE[1] <- df$Alpha[1] * df$Underlying_BS[1] + df$Eta[1] * df$C585_Rep[1]
+  
+  for (j in 2:nrow(df)) {
+    df$OP[j] <- df$C585_BS[j] 
+    df$RE[j] <- df$Alpha[j-1] * df$Underlying_BS[j] + df$Eta[j-1] * df$C585_Rep[j]
+    df$Change_OP_daily[j] <- df$OP[j] - df$OP[j-1]
+    df$Change_RE_daily[j] <- df$RE[j] - df$RE[j-1]
+    df$A_585_daily[j] <- (df$Change_OP_daily[j] -  df$Change_RE_daily[j])^2
+    
+    # Re-hedge
+    df$RE[j] <- df$Alpha[j] * df$Underlying_BS[j] + df$Eta[j] * df$C585_Rep[j]   
+  }
+  return(mean(df$A_585_daily, na.rm = TRUE))
+}
+
+# Re_hedging every x days
+hedge_frequency <- function(df,frequency) {
+  # Dynamically create new columns based on frequency
+  delta_OP <- paste("Change_OP", frequency, "days", sep = "_")
+  delta_RE <- paste("Change_RE", frequency, "days", sep = "_")
+  A <- paste("A_585", frequency, "days", sep = "_")
+  
+  # Initialize 
+  df$OP <- 0
+  df$RE <- 0
+  
+  df$OP[1] <- df$C585_BS[1]
+  df$RE[1] <- df$Alpha[1] * df$Underlying_BS[1] + df$Eta[1] * df$C585_Rep[1]
+  
+  df[[delta_OP]] <- 0
+  df[[delta_RE]] <- 0
+  df[[A]] <- 0
+  a <- 0
+  
+  # Loop through the data frame to hedge at the given frequency
+  for (j in 2:nrow(df)) {
+    
+    a <- a + 1
+    
+    # Calculate the change in option value (Delta_C)
+    df$OP[j] <- df$C585_BS[j] 
+    df$RE[j] <- df$Alpha[j-a] * df$Underlying_BS[j] + df$Eta[j-a] * df$C585_Rep[j]
+    
+    df[[delta_OP]][j] <- df$OP[j] - df$OP[j-1]
+    df[[delta_RE]][j] <- df$RE[j] - df$RE[j-1]
+    df[[A]][j] <- (df[[delta_OP]][j] -  df[[delta_RE]][j])^2
+    
+    # Re-hedge every "frequency" days
+    if (j %% frequency == 1) {
+      a <- 0
+      df$RE[j] <- df$Alpha[j] * df$Underlying_BS[j] + df$Eta[j] * df$C585_Rep[j]
+    } 
+  }
+  
+  return(mean(df[[A]], na.rm = TRUE))
+}
+
+# Perform Delta-Vega Hedging Function
+perform_delta_vega_hedging <- function(data_dict, rep_dates, dates, frequencies = 2:7) {
+  
+  # Initialize results storage
+  hedging_results <- data.frame(
+    OP_Date = character(),
+    RE_Date = character(),
+    Frequency = integer(),
+    MSE = numeric(),
+    stringsAsFactors = FALSE
+  )
+    
+  # Iterate through original portfolio dates
+  for (rep_date in rep_dates) {
+    for (orig_date in dates) {
+      
+      if (orig_date >= rep_date) next
+      
+      rep_data = data_dict[[rep_date]]
+      orig_data <- data_dict[[orig_date]]
+      
+      orig_data$X <- as.Date(orig_data$X)
+      rep_data$X <- as.Date(rep_data$X)
+      
+      # Merge datasets
+      merged_df <- merge(
+        orig_data, 
+        rep_data, 
+        by = "X", 
+        all.x = TRUE, 
+        suffixes = c("_BS", "_Rep")
+      )
+      merged_df <- na.omit(merged_df)
+      
+      
+      # Skip if merge results in no rows
+      if (nrow(merged_df) < 34) next
+      print(merged_df)
+      
+      # Calculate Alpha and Eta
+      merged_df$Alpha <- merged_df$Delta_BS - (merged_df$Vega_BS / merged_df$Vega_Rep) * merged_df$Delta_Rep
+      merged_df$Eta <- merged_df$Vega_BS / merged_df$Vega_Rep
+      
+      # Hedge daily
+      mse_daily <- hedge_daily(merged_df)
+      hedging_results <- rbind(hedging_results, data.frame(
+        OP_Date = orig_date,
+        RE_Date = rep_date,
+        Frequency = 1,
+        MSE = mse_daily,
+        stringsAsFactors = FALSE))
+      
+      
+      # Perform hedging for different frequencies
+      for (freq in frequencies) {
+        
+        mse <- hedge_frequency(merged_df, freq)
+        
+        # Store results
+        hedging_results <- rbind(hedging_results, data.frame(
+          OP_Date = orig_date,
+          RE_Date = rep_date,
+          Frequency = freq,
+          MSE = mse,
+          stringsAsFactors = FALSE
+        ))
+      }
+    }
+  
+  }
+  return(hedging_results)
+}
+
+# Perform hedging
+results <- perform_delta_vega_hedging(
+  data_dict, 
+  rep_dates = c("2024-09-20", "2024-10-11", "2024-09-13", "2024-08-16", "2024-10-18", 
+            "2024-09-20", "2024-11-22", "2024-08-23", "2024-10-25", 
+            "2024-09-27","2024-10-18","2024-11-15"),
+  dates = c("2024-09-20", "2024-10-11", "2024-09-13", "2024-08-16", "2024-10-18", 
+            "2024-09-20", "2024-11-22", "2024-08-23", "2024-10-25", 
+            "2024-09-27","2024-10-18","2024-11-15")
+)
+
+# Summarize results
+summary_results <- results %>%
+  group_by(Frequency) %>%
+  summarise(
+    Mean_MSE = mean(MSE),
+    Median_MSE = median(MSE),
+    Min_MSE = min(MSE),
+    Max_MSE = max(MSE)
+  )
+
+# Print results
+print(results)
+print(summary_results)
+```
+
+## Portfolio of Options
+
+```{r}
+# Import data
+
+date <- c("2024-10-11",
+         "2024-09-13",
+         "2024-11-15",
+         "2024-08-16",
+         "2024-10-18",
+         "2024-09-20",
+         "2024-11-22",
+         "2024-08-23",
+         "2024-10-25",
+         "2024-09-27",
+         "2024-11-29")
+
+files <- c("call_meta_111024.csv",
+           'call_meta_130924.csv',
+           'call_meta_151124.csv',
+           'call_meta_160824.csv',
+           'call_meta_181024.csv',
+           'call_meta_200924.csv',
+           'call_meta_221124.csv',
+           'call_meta_230824.csv',
+           'call_meta_251024.csv',
+           'call_meta_270924.csv',
+           'call_meta_291124.csv')
+
+data_dict <- list()
+
+# Risk-free rate
+r <- 5.219121339 / 100
+
+# Safe Implied Volatility Calculation Function
+safe_calculate_iv <- function(S, E, C, T, r, type) {
+  tryCatch({
+    EuropeanOptionImpliedVolatility(
+      type = type,
+      value = C,
+      underlying = S,
+      strike = E,
+      dividendYield = 0,
+      riskFreeRate = r,
+      maturity = T,
+      volatility = 0.2 # Initial guess for volatility
+    )
+  }, error = function(e) {
+    NA # Return NA if an error occurs
+  })
+}
+
+# Safe Option Greeks Calculation Function
+safe_calculate_greeks <- function(S, E, T, r, sigma, type) {
+  tryCatch({
+    option <- EuropeanOption(
+      type = type,
+      underlying = S,
+      strike = E,
+      riskFreeRate = r,
+      maturity = T,
+      volatility = sigma,
+      dividendYield = 0
+    )
+    list(
+      Delta = option$delta,
+      Vega = option$vega,
+      Gamma = option$gamma
+    )
+  }, error = function(e) {
+    # Return NA for all Greeks if an error occurs
+    list(Delta = NA, Vega = NA, Gamma = NA)
+  })
+}
+
+# Main processing loop
+for (i in seq_along(files)) {
+  
+  # Read data
+  df <- read.csv(files[i])
+  
+  df$Strike_585 <- 585
+  df$Strike_520 <- 520
+  
+  # Process dates and calculate time to maturity
+  df$X <- as.Date(df$X, format = "%Y-%m-%d")
+  df$maturity_date <- as.Date(date[i])
+  df$Time_to_Maturity <- as.numeric(difftime(df$maturity_date, df$X, units = "days")) / 252
+  df <- df[df$Time_to_Maturity > 0 & df$Time_to_Maturity <= 45 / 252, ]
+  
+  # Implied Volatility Calculation (with error handling)
+  df$iv_585_call <- mapply(
+    safe_calculate_iv,
+    S = df$Underlying,
+    E = df$Strike_585,
+    C = df$C585,
+    T = df$Time_to_Maturity,
+    r = r,
+    type = "call"
+  )
+  
+  df$iv_585_put <- mapply(
+    safe_calculate_iv,
+    S = df$Underlying,
+    E = df$Strike_585,
+    C = df$P585,
+    T = df$Time_to_Maturity,
+    r = r,
+    type = "put"
+  )
+  
+  # Greeks Calculation for Strike 585
+  greeks_585_call <- mapply(
+    function(S, E, T, sigma) {
+      safe_calculate_greeks(S, E, T, r, sigma, type = "call")
+    },
+    S = df$Underlying,
+    E = df$Strike_585,
+    T = df$Time_to_Maturity,
+    sigma = df$iv_585_call,
+    SIMPLIFY = FALSE
+  )
+  
+  # Greeks Calculation for Strike 520
+  greeks_585_put <- mapply(
+    function(S, E, T, sigma) {
+      safe_calculate_greeks(S, E, T, r, sigma, type = "put")
+    },
+    S = df$Underlying,
+    E = df$Strike_585,
+    T = df$Time_to_Maturity,
+    sigma = df$iv_585_put,
+    SIMPLIFY = FALSE
+  )
+  
+  # Unpack Greeks into columns
+  df$Delta_585_call <- sapply(greeks_585_call, `[[`, "Delta")
+  df$Vega_585_call  <- sapply(greeks_585_call, `[[`, "Vega")
+  df$Gamma_585_call <- sapply(greeks_585_call, `[[`, "Gamma")
+  
+  df$Delta_585_put <- sapply(greeks_585_put, `[[`, "Delta")
+  df$Vega_585_put  <- sapply(greeks_585_put, `[[`, "Vega")
+  df$Gamma_585_put <- sapply(greeks_585_put, `[[`, "Gamma")
+  
+  df <- na.omit(df)
+  
+  df$Delta <- df$Delta_585_call + df$Delta_585_put 
+  df$Vega <- df$Vega_585_call + df$Vega_585_put
+  df$Gamma <- df$Gamma_585_call + df$Gamma_585_put
+  
+  # Store the processed dataframe in the dictionary
+  data_dict[[date[i]]] <- df
+}
+```
+
+```{r}
+data_dict[["2024-11-29"]][,c("X","Delta_585_call","Delta_585_put","Vega_585_call","Vega_585_put","Gamma_585_put","Gamma_585_call")]
+```
+
+
+### Delta
+
+```{r}
+# Daily hedge
+hedge_daily <- function(df) {
+  df$OP <- 0
+  df$RE <- 0
+  df$Change_OP_daily <- 0
+  df$Change_RE_daily <- 0
+  df$A_585_daily <- 0
+
+
+  # First trading date
+  df$OP[1] <- df$C585[1] + df$P585[1]
+  df$RE[1] <- df$Delta[1]*df$Underlying[1]
+  
+  for (j in 2:nrow(df)) {
+    df$OP[j] <- df$C585[j] + df$P585[j] 
+    df$RE[j] <- df$Delta[j-1] * df$Underlying[j]
+    df$Change_OP_daily[j] <- df$OP[j] - df$OP[j-1]
+    df$Change_RE_daily[j] <- df$RE[j] - df$RE[j-1]
+    df$A_585_daily[j] <- (df$Change_OP_daily[j] -  df$Change_RE_daily[j])^2
+    
+    # Re-hedge
+    df$RE[j] <- df$Delta[j] * df$Underlying[j]  
+  }
+  return(mean(df$A_585_daily, na.rm = TRUE))
+}
+
+
+# Re_hedging every x days
+hedge_frequency <- function(df,frequency) {
+  # Dynamically create new columns based on frequency
+  delta_OP <- paste("Change_OP", frequency, "days", sep = "_")
+  delta_RE <- paste("Change_RE", frequency, "days", sep = "_")
+  A <- paste("A_585", frequency, "days", sep = "_")
+  
+  # Initialize 
+  df$OP <- 0
+  df$RE <- 0
+  
+  df$OP[1] <- df$C585[1] + df$P585[1]
+  df$RE[1] <- df$Delta[1]*df$Underlying[1]
+  
+  df[[delta_OP]] <- 0
+  df[[delta_RE]] <- 0
+  df[[A]] <- 0
+  a <- 0
+  
+  # Loop through the data frame to hedge at the given frequency
+  for (j in 2:nrow(df)) {
+    
+    a <- a + 1
+    
+    # Calculate the change in option value (Delta_C)
+    df$OP[j] <- df$C585[j] + df$P585[j]
+    df$RE[j] <- df$Delta[j-a]*df$Underlying[j]
+    
+    df[[delta_OP]][j] <- df$OP[j] - df$OP[j-1]
+    df[[delta_RE]][j] <- df$RE[j] - df$RE[j-1]
+    df[[A]][j] <- (df[[delta_OP]][j] -  df[[delta_RE]][j])^2
+    
+    # Re-hedge every "frequency" days
+    if (j %% frequency == 1) {
+      a <- 0
+      df$RE[j] <- df$Delta[j]*df$Underlying[j]
+    } 
+  }
+  
+  return(mean(df[[A]], na.rm = TRUE))
+}
+
+# Initialize results storage
+delta_hedging_results_port <- data.frame(
+  OP_Date = character(),
+  Frequency = integer(),
+  MSE = numeric(),
+  stringsAsFactors = FALSE
+)
+
+
+for (i in seq_along(date)) {
+  df = data_dict[[date[i]]]
+  
+  # Hedge daily
+  mse_daily <- hedge_daily(df)
+  
+  delta_hedging_results_port <- rbind(delta_hedging_results_port, data.frame(
+    OP_Date = date[i],
+    Frequency = 1,
+    MSE = mse_daily,
+    stringsAsFactors = FALSE))
+    
+    
+  # Hedging every x days
+  for (freq in 2:7) {
+    mse <- hedge_frequency(df, freq)
+      
+  
+    delta_hedging_results_port <- rbind(delta_hedging_results_port, data.frame(
+      OP_Date = date[i],
+      Frequency = freq,
+      MSE = mse,
+      stringsAsFactors = FALSE
+    ))
+  }
+}
+
+
+
+# Summarize results
+summary_results <- delta_hedging_results_port %>%
+  group_by(Frequency) %>%
+  summarise(
+    Mean_MSE = mean(MSE),
+    STD_MSE = sd(MSE),
+    Min_MSE = min(MSE),
+    Max_MSE = max(MSE)
+  )
+
+# Print results
+print(delta_hedging_results_port)
+print(summary_results)
+```
+
+### Delta - Vega
+
+```{r}
+# Daily hedge
+hedge_daily <- function(df) {
+  df$OP <- 0
+  df$RE <- 0
+  df$Change_OP_daily <- 0
+  df$Change_RE_daily <- 0
+  df$A_585_daily <- 0
+
+
+  # First trading date
+  df$OP[1] <- df$C585_BS[1] + df$P585_BS[1]
+  df$RE[1] <- df$Alpha[1] * df$Underlying_BS[1] + df$Eta[1] * df$C585_Rep[1]
+  
+  for (j in 2:nrow(df)) {
+    df$OP[j] <- df$C585_BS[j] + df$P585_BS[j]
+    df$RE[j] <- df$Alpha[j-1] * df$Underlying_BS[j] + df$Eta[j-1] * df$C585_Rep[j]
+    df$Change_OP_daily[j] <- df$OP[j] - df$OP[j-1]
+    df$Change_RE_daily[j] <- df$RE[j] - df$RE[j-1]
+    df$A_585_daily[j] <- (df$Change_OP_daily[j] -  df$Change_RE_daily[j])^2
+    
+    # Re-hedge
+    df$RE[j] <- df$Alpha[j] * df$Underlying_BS[j] + df$Eta[j] * df$C585_Rep[j]   
+  }
+  return(mean(df$A_585_daily, na.rm = TRUE))
+}
+
+# Re_hedging every x days
+hedge_frequency <- function(df,frequency) {
+  # Dynamically create new columns based on frequency
+  delta_OP <- paste("Change_OP", frequency, "days", sep = "_")
+  delta_RE <- paste("Change_RE", frequency, "days", sep = "_")
+  A <- paste("A_585", frequency, "days", sep = "_")
+  
+  # Initialize 
+  df$OP <- 0
+  df$RE <- 0
+  
+  df$OP[1] <- df$C585_BS[1] + df$P585_BS[1]
+  df$RE[1] <- df$Alpha[1] * df$Underlying_BS[1] + df$Eta[1] * df$C585_Rep[1]
+  
+  df[[delta_OP]] <- 0
+  df[[delta_RE]] <- 0
+  df[[A]] <- 0
+  a <- 0
+  
+  # Loop through the data frame to hedge at the given frequency
+  for (j in 2:nrow(df)) {
+    
+    a <- a + 1
+    
+    # Calculate the change in option value (Delta_C)
+    df$OP[j] <- df$C585_BS[j] + df$P585_BS[j]
+    df$RE[j] <- df$Alpha[j-a] * df$Underlying_BS[j] + df$Eta[j-a] * df$C585_Rep[j]
+    
+    df[[delta_OP]][j] <- df$OP[j] - df$OP[j-1]
+    df[[delta_RE]][j] <- df$RE[j] - df$RE[j-1]
+    df[[A]][j] <- (df[[delta_OP]][j] -  df[[delta_RE]][j])^2
+    
+    # Re-hedge every "frequency" days
+    if (j %% frequency == 1) {
+      a <- 0
+      df$RE[j] <- df$Alpha[j] * df$Underlying_BS[j] + df$Eta[j] * df$C585_Rep[j]
+    } 
+  }
+  
+  return(mean(df[[A]], na.rm = TRUE))
+}
+
+# Perform Delta-Vega Hedging Function
+delta_vega_port_hedging <- function(data_dict, rep_dates, dates, frequencies = 2:7) {
+  
+  # Initialize results storage
+  delta_vega_port_results <- data.frame(
+    OP_Date = character(),
+    RE_Date = character(),
+    Frequency = integer(),
+    MSE = numeric(),
+    stringsAsFactors = FALSE
+  )
+    
+  # Iterate through original portfolio dates
+  for (rep_date in rep_dates) {
+    for (orig_date in dates) {
+      
+      if (orig_date >= rep_date) next
+      
+      rep_data = data_dict[[rep_date]]
+      orig_data <- data_dict[[orig_date]]
+      
+      orig_data$X <- as.Date(orig_data$X)
+      rep_data$X <- as.Date(rep_data$X)
+      
+      # Merge datasets
+      merged_df <- merge(
+        orig_data, 
+        rep_data, 
+        by = "X", 
+        all.x = TRUE, 
+        suffixes = c("_BS", "_Rep")
+      )
+     
+      merged_df <- na.omit(merged_df)
+      
+      # Skip if merge results in no rows
+      if (nrow(merged_df) < 25) next
+      
+      # Calculate Alpha and Eta
+      merged_df$Alpha <- merged_df$Delta_BS - (merged_df$Vega_BS / merged_df$Vega_Rep) * merged_df$Delta_Rep
+      merged_df$Eta <- merged_df$Vega_BS / merged_df$Vega_Rep
+      
+      # Hedge daily
+      mse_daily <- hedge_daily(merged_df)
+      delta_vega_port_results <- rbind(delta_vega_port_results, data.frame(
+        OP_Date = orig_date,
+        RE_Date = rep_date,
+        Frequency = 1,
+        MSE = mse_daily,
+        stringsAsFactors = FALSE))
+      
+      
+      # Perform hedging for different frequencies
+      for (freq in frequencies) {
+        
+        mse <- hedge_frequency(merged_df, freq)
+        
+        # Store results
+        delta_vega_port_results <- rbind(delta_vega_port_results, data.frame(
+          OP_Date = orig_date,
+          RE_Date = rep_date,
+          Frequency = freq,
+          MSE = mse,
+          stringsAsFactors = FALSE
+        ))
+      }
+    }
+  
+  }
+  return(delta_vega_port_results)
+}
+
+# Perform hedging
+delta_vega_port_results <- delta_vega_port_hedging(
+  data_dict, 
+  rep_dates = c("2024-09-20", "2024-10-11", "2024-09-13", "2024-08-16", "2024-10-18", 
+            "2024-09-20", "2024-11-22", "2024-08-23", "2024-10-25", 
+            "2024-09-27","2024-10-18","2024-11-15"),
+  dates = c("2024-09-20", "2024-10-11", "2024-09-13", "2024-08-16", "2024-10-18", 
+            "2024-09-20", "2024-11-22", "2024-08-23", "2024-10-25", 
+            "2024-09-27","2024-10-18","2024-11-15")
+)
+
+# Summarize results
+summary_results <- delta_vega_port_results %>%
+  group_by(Frequency) %>%
+  summarise(
+    Mean_MSE = mean(MSE),
+    STD_MSE = sd(MSE),
+    Min_MSE = min(MSE),
+    Max_MSE = max(MSE)
+  )
+
+# Print results
+print(delta_vega_port_results)
+print(summary_results)
+```
+
+## Vega from system
+
+```{r}
+vega_111024 <- read.csv("vega_data_111024.csv")
+vega_181024 <- read.csv("vega_data_181024.csv")
+vega_200924 <- read.csv("vega_data_200924.csv")
+vega_181024
+vega_200924
+vega_111024
+```
